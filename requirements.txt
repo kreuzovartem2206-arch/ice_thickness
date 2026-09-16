@@ -1,0 +1,8 @@
+numpy>=2.0
+pandas>=2.2
+requests>=2.32
+xarray>=2025.1
+netCDF4>=1.7
+pyproj>=3.7
+rasterio>=1.4
+matplotlib>=3.9
