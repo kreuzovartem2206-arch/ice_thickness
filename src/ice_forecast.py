@@ -197,13 +197,22 @@ def training_rows(obs, max_age_days=7, history_days=28):
     targets = obs.groupby(['ix', 'iy', 'day']).agg(target_sit_m=('sit_m', 'median'),
                     target_available_at=('available_at', 'max')).reset_index().rename(columns={'day': 'target_day'})
     rows = []
-    for day in sorted(obs.day.unique()):
-        issue = utc(day) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
-        f = features_at(obs, issue, max_age_days, history_days)
+    dates = sorted(targets.target_day.unique())
+    observation_cells = pd.MultiIndex.from_frame(obs[['ix', 'iy']])
+    for index, target_day in enumerate(dates, 1):
+        # Forecast origins need not themselves have a satellite overpass. Build
+        # an issue date seven days before every observed target day.
+        issue = utc(target_day) - pd.Timedelta(days=6) - pd.Timedelta(microseconds=1)
+        todays_targets = targets[targets.target_day == target_day]
+        cells = pd.MultiIndex.from_frame(todays_targets[['ix', 'iy']])
+        eligible = obs.loc[observation_cells.isin(cells)]
+        f = features_at(eligible, issue, max_age_days, history_days)
         if not f.empty:
-            paired = f.merge(targets, on=['ix', 'iy', 'target_day'], how='inner', validate='one_to_one')
+            paired = f.merge(todays_targets, on=['ix', 'iy', 'target_day'], how='inner', validate='one_to_one')
             if not paired.empty:
                 rows.append(paired)
+        if index % 20 == 0 or index == len(dates):
+            print(f'Training pairs: target dates {index}/{len(dates)}', flush=True)
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 

@@ -12,6 +12,7 @@ import shutil
 import time
 from urllib.parse import urlparse
 import zipfile
+import xml.etree.ElementTree as ET
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -109,6 +110,117 @@ def safe_members(zf, staging):
         yield info
 
 
+def standard_checksum(manifest):
+    """Read the standard NetCDF checksum from the original SAFE manifest."""
+    root = ET.fromstring(manifest)
+    for stream in root.iter():
+        if stream.tag.rsplit('}', 1)[-1] != 'byteStream':
+            continue
+        children = list(stream)
+        if not any(e.tag.rsplit('}', 1)[-1] == 'fileLocation' and
+                   e.attrib.get('href', '').removeprefix('./') == 'standard_measurement.nc' for e in children):
+            continue
+        for e in children:
+            if e.tag.rsplit('}', 1)[-1] == 'checksum' and e.attrib.get('checksumName', '').upper() == 'MD5':
+                return int(stream.attrib['size']), (e.text or '').strip().lower()
+    raise ValueError('Manifest has no MD5 checksum for standard_measurement.nc')
+
+
+def product_nodes(s, item):
+    if not NAME.fullmatch(item['Name']):
+        raise ValueError('Unexpected product name')
+    url = f"{DOWNLOAD}({item['Id']})/Nodes({item['Name']})/Nodes"
+    r = s.get(url, timeout=120)
+    r.raise_for_status()
+    nodes = {n['Name']: n for n in r.json()['result']}
+    for name in ['standard_measurement.nc', 'xfdumanifest.xml']:
+        if name not in nodes or int(nodes[name]['ContentLength']) <= 0:
+            raise ValueError(f'Missing or empty {name}')
+    return nodes
+
+
+def download_node(s, auth, item, name, expected_size, destination):
+    if name not in ['standard_measurement.nc', 'xfdumanifest.xml']:
+        raise ValueError('Unsupported product component')
+    url = f"{DOWNLOAD}({item['Id']})/Nodes({item['Name']})/Nodes({name})/$value"
+    for attempt in range(2):
+        response = s.get(url, headers={'Authorization': 'Bearer ' + auth.token(force=attempt > 0)},
+                         stream=True, timeout=(30, 180))
+        if response.status_code == 401 and attempt == 0:
+            response.close()
+            continue
+        response.raise_for_status()
+        break
+    size, digest = 0, hashlib.md5()
+    with response, destination.open('wb') as f:
+        for chunk in response.iter_content(1024 * 1024):
+            size += len(chunk)
+            if size > expected_size:
+                raise ValueError('Component exceeds catalogue size')
+            f.write(chunk)
+            digest.update(chunk)
+    if size != expected_size:
+        raise ValueError('Incomplete component download')
+    return size, digest.hexdigest()
+
+
+def download_standard(items, raw_dir, max_products=6000, max_gb=40):
+    """Fetch only the original L2 standard NetCDF and its checksum manifest."""
+    root = Path(raw_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    s, auth, count, transferred = session(), Auth(), 0, 0
+    if any(not NAME.fullmatch(i['Name']) for i in items):
+        raise ValueError('Unexpected product name')
+    progress_path = root.parent / 'standard-download-progress.json'
+    pending = [i for i in items if not ((root / i['Name'] / 'download.json').exists() and
+                                      (root / i['Name'] / 'standard_measurement.nc').exists())]
+    save_json(progress_path, {'status': 'starting', 'remaining_products': len(pending)})
+    for index, item in enumerate(pending):
+        if count >= max_products:
+            break
+        if not NAME.fullmatch(item['Name']):
+            raise ValueError('Unexpected product name')
+        destination = root / item['Name']
+        if destination.exists():
+            raise RuntimeError(f'Unverified existing directory: {destination}')
+        nodes = product_nodes(s, item)
+        sizes = {name: int(nodes[name]['ContentLength']) for name in ['standard_measurement.nc', 'xfdumanifest.xml']}
+        total = sum(sizes.values())
+        if transferred + total > max_gb * 1e9:
+            break
+        if shutil.disk_usage(root).free < total * 2 + 1e9:
+            raise RuntimeError('Insufficient disk space')
+        print(f'L2 standard {index + 1}/{len(pending)}: {item["Name"]} ({total/1e6:.1f} MB)', flush=True)
+        staging = root / (item['Name'] + '.standard-part')
+        staging.mkdir(exist_ok=True)
+        download_node(s, auth, item, 'xfdumanifest.xml', sizes['xfdumanifest.xml'], staging / 'xfdumanifest.xml')
+        expected_size, expected_md5 = standard_checksum((staging / 'xfdumanifest.xml').read_bytes())
+        if expected_size != sizes['standard_measurement.nc']:
+            raise ValueError('Manifest and catalogue disagree on NetCDF size')
+        _, actual_md5 = download_node(s, auth, item, 'standard_measurement.nc', expected_size, staging / 'standard_measurement.nc')
+        if actual_md5 != expected_md5:
+            raise ValueError('NetCDF MD5 does not match original manifest')
+        import netCDF4
+        with netCDF4.Dataset(staging / 'standard_measurement.nc') as ds:
+            if 'time_20_ku' not in ds.variables or getattr(ds, 'product_name', item['Name']) != item['Name']:
+                raise ValueError('NetCDF product identity/schema mismatch')
+        save_json(staging / 'download.json', {**item, 'download_scope': 'standard_only',
+                   'downloaded_bytes': total, 'standard_md5': actual_md5})
+        staging.replace(destination)
+        count += 1
+        transferred += total
+        save_json(progress_path, {'status': 'downloading', 'completed_this_run': count,
+                  'transferred_gb': transferred / 1e9, 'remaining_products': len(pending) - count,
+                  'last_product': item['Name']})
+    complete = count == len(pending)
+    save_json(progress_path, {'status': 'complete' if complete else 'limit_reached',
+              'completed_this_run': count, 'transferred_gb': transferred / 1e9,
+              'remaining_products': len(pending) - count})
+    print(json.dumps({'status': 'complete' if complete else 'limit_reached', 'downloaded': count,
+                      'transferred_gb': transferred / 1e9}), flush=True)
+    return complete
+
+
 def download(items, raw_dir, max_products=20, max_gb=5):
     root = Path(raw_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -118,6 +230,8 @@ def download(items, raw_dir, max_products=20, max_gb=5):
             raise ValueError('Unexpected product name')
         destination = root / item['Name']
         if (destination / 'download.json').exists() and (destination / 'standard_measurement.nc').exists():
+            if json.loads((destination / 'download.json').read_text(encoding='utf-8')).get('download_scope') == 'standard_only':
+                raise RuntimeError('Existing product contains standard-only files; use --standard-only or a separate directory for full ZIPs.')
             continue
         if destination.exists():
             raise RuntimeError(f'Unverified existing product: {destination}; use a separate download directory.')
@@ -193,6 +307,7 @@ def main():
     dl.add_argument('--raw-dir', required=True)
     dl.add_argument('--max-products', type=int, default=20)
     dl.add_argument('--max-gb', type=float, default=5)
+    dl.add_argument('--standard-only', action='store_true', help='Only standard_measurement.nc plus original checksum manifest')
     args = p.parse_args()
     if args.command == 'catalogue':
         from datetime import date
@@ -206,8 +321,13 @@ def main():
     else:
         if args.max_products < 1 or args.max_gb <= 0:
             p.error('Download limits must be positive')
-        download(json.loads(Path(args.catalogue).read_text(encoding='utf-8'))['products'],
-                 args.raw_dir, args.max_products, args.max_gb)
+        items = json.loads(Path(args.catalogue).read_text(encoding='utf-8'))['products']
+        if args.standard_only:
+            complete = download_standard(items, args.raw_dir, args.max_products, args.max_gb)
+            if not complete:
+                raise SystemExit(3)
+        else:
+            download(items, args.raw_dir, args.max_products, args.max_gb)
 
 
 if __name__ == '__main__':

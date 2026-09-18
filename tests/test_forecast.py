@@ -59,6 +59,16 @@ def test_stale_cells_do_not_get_forecasts():
     assert features_at(observations(2, 1), '2025-02-01T00:00Z').empty
 
 
+def test_issue_date_does_not_require_an_overpass():
+    obs = observations(20, 1)
+    obs = obs[obs.day.dt.day.ne(10)]
+    rows = training_rows(obs)
+    row = rows[rows.target_day == pd.Timestamp('2025-01-17T00:00Z')]
+    assert len(row) == 1
+    assert row.issue_time.dt.day.iloc[0] == 10
+    assert row.last_obs_time.dt.day.iloc[0] == 9
+
+
 def test_nt_delay_is_respected_without_rewriting_publication_dates():
     obs = observations(60, 1)
     obs['available_at'] = obs.obs_time + pd.Timedelta(days=28)
