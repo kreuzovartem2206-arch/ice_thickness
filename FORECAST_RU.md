@@ -165,6 +165,27 @@ MD5 и размер NetCDF сверяются с манифестом. `enhanced
 продукты пропускаются, незавершённый отдельный продукт загружается заново.
 Предел 40 ГБ относится к новым скачиваниям одного запуска.
 
+## Проверка готовой модели на новом сезоне
+
+`evaluate` применяет сохранённый `model.joblib` без переобучения к новым парам
+«день → +7» и сравнивает его с сохранением последней толщины. Оцениваются только
+даты выпуска не раньше `--start` и строго после данных, на которых модель обучалась
+(`trained_until`). Пары строятся тем же кодом, что в `train`, с теми же 45/90 днями для NT.
+
+```powershell
+.\.venv\Scripts\python.exe src/cdse_archive.py catalogue --start 2025-10-01 --end 2026-12-31 --timeliness NT --out data/catalogue-nt-winter.json
+.\.venv\Scripts\python.exe src/cdse_archive.py download --catalogue data/catalogue-nt-winter.json --raw-dir data/raw/sentinel3-nt --standard-only --max-products 6000 --max-gb 25
+.\.venv\Scripts\python.exe src/ice_forecast.py ingest --raw-dir data/raw/sentinel3-nt --timeliness NT --catalogue data/catalogue-nt-winter.json --out data/observations-nt-winter.csv
+.\.venv\Scripts\python.exe src/ice_forecast.py evaluate --observations data/observations-nt-winter.csv --model outputs/weekly-training/model/model.joblib --start 2026-11-01 --out outputs/winter-evaluation
+```
+
+Каталог берётся с начала архива: признакам нужна история за 90 дней. Уже скачанные
+продукты пропускаются, догружаются только новые. Результат: `evaluation.json`
+(итог и разбивка по неделям целевого дня) и `evaluation_predictions.csv`.
+Статус `evaluated_below_minimum_gate` означает меньше 100 пар или 14 дат выпуска:
+числа тогда предварительные. Из-за задержки NT около 26 дней первые 14 дат с целями
+с 1 ноября появятся в каталоге примерно к 10 декабря.
+
 ## Первичные источники
 
 - [CDSE OData: каталог и загрузка](https://documentation.dataspace.copernicus.eu/APIs/OData.html)

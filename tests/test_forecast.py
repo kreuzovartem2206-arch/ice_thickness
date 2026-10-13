@@ -9,7 +9,7 @@ import pytest
 import xarray as xr
 
 from src.cdse_archive import safe_members
-from src.ice_forecast import FEATURES, features_at, training_rows, split_rows, read_product, train, forecast
+from src.ice_forecast import FEATURES, features_at, training_rows, split_rows, read_product, train, forecast, evaluate
 
 
 def observations(days=120, cells=10):
@@ -147,3 +147,27 @@ def test_end_to_end_synthetic_smoke_only(tmp_path):
     assert pd.to_datetime(result.target_day, utc=True).eq(pd.Timestamp('2025-05-27T00:00Z')).all()
     report = json.loads((tmp_path / 'model/metrics.json').read_text())
     assert report['test']['selected']['n'] > 0
+
+
+def test_evaluate_scores_saved_model_without_retraining(tmp_path):
+    path = tmp_path / 'obs.csv'
+    observations(200).to_csv(path, index=False)
+    train(path, tmp_path / 'model', '2025-03-01', '2025-04-01')
+    model_path = tmp_path / 'model/model.joblib'
+    before = model_path.read_bytes()
+    report = evaluate(path, model_path, '2025-05-01', tmp_path / 'eval')
+    assert model_path.read_bytes() == before
+    assert report['retrained'] is False
+    scored = pd.read_csv(tmp_path / 'eval/evaluation_predictions.csv', parse_dates=['issue_time'])
+    assert scored.issue_time.min() >= pd.Timestamp('2025-05-01T00:00Z')
+    assert report['counts']['issue_days'] == scored.issue_time.nunique() >= 14
+    assert report['overall']['model']['n'] == len(scored)
+    assert report['weekly_by_target_day']
+
+
+def test_evaluate_never_scores_before_training_availability(tmp_path):
+    path = tmp_path / 'obs.csv'
+    observations(200).to_csv(path, index=False)
+    train(path, tmp_path / 'model', '2025-03-01', '2025-04-01')
+    report = evaluate(path, tmp_path / 'model/model.joblib', '2025-01-01', tmp_path / 'eval')
+    assert pd.Timestamp(report['first_issue']) > pd.Timestamp(report['model_trained_until'])
