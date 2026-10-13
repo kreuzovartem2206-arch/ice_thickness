@@ -290,21 +290,71 @@ def train(obs_path, out, val_start, test_start, allow_estimated_availability=Fal
     print(json.dumps(report, indent=2))
 
 
-def forecast(obs_path, model_path, issue_time, out):
+def predict_bundle(bundle, frame):
+    if bundle['selected'] != 'gradient_boosting':
+        return frame.last_sit_m.to_numpy()
+    return np.clip(frame.last_sit_m.to_numpy() + bundle['model'].predict(frame[FEATURES]), 0, 15)
+
+
+def load_matching(obs_path, model_path):
     # Load only model artifacts created locally by this trusted program (joblib uses pickle).
     bundle = joblib.load(model_path)
     obs = load_observations(obs_path)
     for key in ['grid_m', 'baseline', 'timeliness']:
         if str(obs[key].iloc[0]) != str(bundle[key]):
             raise ValueError('Model/input mismatch: ' + key)
+    return bundle, obs
+
+
+def evaluate(obs_path, model_path, start, out, end=None):
+    """Score a saved model, unchanged, on pairs issued after its training data and after `start`."""
+    bundle, obs = load_matching(obs_path, model_path)
+    if not obs.availability_verified.all():
+        raise ValueError('Publication dates are missing; evaluation needs catalogue availability.')
+    begin, trained_until = utc(start), utc(bundle['trained_until'])
+    rows = training_rows(obs, bundle['max_age_days'], bundle['history_days'])
+    if not rows.empty:
+        # As in forecast: every scored issue strictly follows the data the model learned from.
+        rows = rows[(rows.issue_time >= begin) & (rows.issue_time > trained_until)]
+        if end:
+            rows = rows[rows.target_day < utc(end)]
+    output = Path(out)
+    output.mkdir(parents=True, exist_ok=True)
+    counts = {'rows': len(rows), 'issue_days': int(rows.issue_time.nunique()) if len(rows) else 0}
+    if rows.empty:
+        save_json(output / 'evaluation.json', {'status': 'insufficient_data', 'counts': counts,
+                  'reason': 'No seven-day pairs after the start date and training availability.'})
+        raise ValueError('No evaluation pairs; extend the archive past the start date.')
+    rows = rows.copy()
+    rows['prediction_m'] = predict_bundle(bundle, rows)
+    rows['week'] = rows.target_day.dt.tz_localize(None).dt.to_period('W-SUN').dt.start_time.dt.date.astype(str)
+    weekly = {week: {'model': metrics(g.target_sit_m, g.prediction_m),
+                     'persistence': metrics(g.target_sit_m, g.last_sit_m)}
+              for week, g in rows.groupby('week')}
+    enough = counts['rows'] >= 100 and counts['issue_days'] >= 14
+    report = {'status': 'evaluated' if enough else 'evaluated_below_minimum_gate',
+              'model': bundle['selected'], 'model_trained_until': bundle['trained_until'],
+              'retrained': False, 'start': begin.isoformat(), 'first_issue': rows.issue_time.min().isoformat(), 'end_exclusive': end, 'counts': counts,
+              'target_days': [rows.target_day.min().isoformat(), rows.target_day.max().isoformat()],
+              'overall': {'model': metrics(rows.target_sit_m, rows.prediction_m),
+                          'persistence': metrics(rows.target_sit_m, rows.last_sit_m)},
+              'weekly_by_target_day': weekly,
+              'gate': '>=100 pairs and >=14 issue dates, as in train; a minimum, not proof of sufficiency.'}
+    rows[['ix', 'iy', 'issue_time', 'target_day', 'target_sit_m', 'last_sit_m', 'age_days',
+          'prediction_m']].to_csv(output / 'evaluation_predictions.csv', index=False)
+    save_json(output / 'evaluation.json', report)
+    print(json.dumps({k: report[k] for k in ['status', 'counts', 'target_days', 'overall']}, indent=2))
+    return report
+
+
+def forecast(obs_path, model_path, issue_time, out):
+    bundle, obs = load_matching(obs_path, model_path)
     if utc(issue_time) <= utc(bundle['trained_until']):
         raise ValueError('Forecast issue must follow training-data availability')
     f = features_at(obs, issue_time, bundle['max_age_days'], bundle['history_days'])
     if f.empty:
         raise ValueError('No eligible observations within the model age limit')
-    f['forecast_sit_m'] = f.last_sit_m
-    if bundle['selected'] == 'gradient_boosting':
-        f['forecast_sit_m'] = np.clip(f.last_sit_m + bundle['model'].predict(f[FEATURES]), 0, 15)
+    f['forecast_sit_m'] = predict_bundle(bundle, f)
     f['model'] = bundle['selected']
     f['status'] = 'experimental_unvalidated_for_navigation'
     out = Path(out)
@@ -361,6 +411,12 @@ def main():
     pred.add_argument('--model', required=True)
     pred.add_argument('--issue-time', required=True, help='Explicit UTC timestamp')
     pred.add_argument('--out', required=True)
+    ev = sub.add_parser('evaluate', help='Score a saved model without retraining')
+    ev.add_argument('--observations', required=True)
+    ev.add_argument('--model', required=True)
+    ev.add_argument('--start', required=True, help='First UTC issue date to score; never before training availability')
+    ev.add_argument('--end', help='Exclusive UTC target date')
+    ev.add_argument('--out', required=True)
     args = p.parse_args()
     try:
         if args.command == 'ingest':
@@ -369,6 +425,8 @@ def main():
             ingest(args.raw_dir, args.out, args.grid_m, args.timeliness, args.baseline, args.catalogue)
         elif args.command == 'train':
             train(args.observations, args.out, args.validation_start, args.test_start, args.allow_estimated_availability)
+        elif args.command == 'evaluate':
+            evaluate(args.observations, args.model, args.start, args.out, args.end)
         else:
             forecast(args.observations, args.model, args.issue_time, args.out)
     except (ValueError, RuntimeError) as exc:
