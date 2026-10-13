@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import time as time_module
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -38,6 +39,10 @@ TOKEN_URL = (
 )
 OUTPUT_CRS = CRS.from_epsg(3413)
 RHO_W = 1024.0
+# Timeliness preference for duplicate Sentinel-3 versions of the same pass:
+# non-time-critical is the best-quality reprocessing, near-real-time the worst.
+TIMELINESS_RANK = {"NT": 3, "ST": 2, "NR": 1}
+TOKEN_REFRESH_MARGIN_S = 60.0
 MIN_LAT = 65.0
 MAX_LAT = 90.0
 MIN_LON_360 = 30.0
@@ -74,31 +79,70 @@ def russian_arctic_mask(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
     )
 
 
-def get_access_token() -> str:
-    token = os.getenv("CDSE_ACCESS_TOKEN")
-    if token:
-        return token.strip()
+class CdseAuth:
+    """CDSE bearer token that is refreshed before it expires.
 
-    username = os.getenv("CDSE_USERNAME") or input("CDSE username: ").strip()
-    password = os.getenv("CDSE_PASSWORD") or getpass.getpass("CDSE password: ")
+    CDSE access tokens live about 10 minutes, which is shorter than a 7-day
+    download, so the token is renewed with the refresh token when needed.
+    """
 
-    data = {
-        "client_id": "cdse-public",
-        "username": username,
-        "password": password,
-        "grant_type": "password",
-    }
-    totp = os.getenv("CDSE_TOTP")
-    if totp:
-        data["totp"] = totp
+    def __init__(self) -> None:
+        self._access: str | None = None
+        self._refresh: str | None = None
+        self._expires_at = 0.0
+        self._static = os.getenv("CDSE_ACCESS_TOKEN")
+        if self._static:
+            self._access = self._static.strip()
+            self._expires_at = float("inf")
 
-    response = requests.post(TOKEN_URL, data=data, timeout=60)
-    if response.status_code == 401:
-        raise RuntimeError(
-            "CDSE authentication failed (401). Check email/password and, if 2FA is enabled, set CDSE_TOTP."
-        )
-    response.raise_for_status()
-    return response.json()["access_token"]
+    def _store(self, payload: dict) -> None:
+        self._access = payload["access_token"]
+        self._refresh = payload.get("refresh_token")
+        self._expires_at = time_module.monotonic() + float(payload.get("expires_in", 600))
+
+    def _login(self) -> None:
+        username = os.getenv("CDSE_USERNAME") or input("CDSE username: ").strip()
+        password = os.getenv("CDSE_PASSWORD") or getpass.getpass("CDSE password: ")
+        data = {
+            "client_id": "cdse-public",
+            "username": username,
+            "password": password,
+            "grant_type": "password",
+        }
+        totp = os.getenv("CDSE_TOTP")
+        if totp:
+            data["totp"] = totp
+        response = requests.post(TOKEN_URL, data=data, timeout=60)
+        if response.status_code == 401:
+            raise RuntimeError(
+                "CDSE authentication failed (401). Check email/password and, if 2FA is enabled, set CDSE_TOTP."
+            )
+        response.raise_for_status()
+        self._store(response.json())
+
+    def _refresh_access(self) -> None:
+        if self._refresh:
+            response = requests.post(
+                TOKEN_URL,
+                data={"client_id": "cdse-public", "grant_type": "refresh_token", "refresh_token": self._refresh},
+                timeout=60,
+            )
+            if response.ok:
+                self._store(response.json())
+                return
+        # Refresh token expired or missing: log in again.
+        self._login()
+
+    def token(self, force_refresh: bool = False) -> str:
+        if self._static:
+            if force_refresh:
+                raise RuntimeError("CDSE_ACCESS_TOKEN was rejected or expired; unset it to log in with a password.")
+            return self._access
+        if self._access is None:
+            self._login()
+        elif force_refresh or time_module.monotonic() > self._expires_at - TOKEN_REFRESH_MARGIN_S:
+            self._refresh_access()
+        return self._access
 
 
 def product_filter(start: datetime, end: datetime) -> str:
@@ -144,20 +188,73 @@ def search_s3_products(start: datetime, end: datetime) -> list[Product]:
     return choose_s3_timeliness(products)
 
 
-def choose_s3_timeliness(products: list[Product]) -> list[Product]:
-    """Avoid double-counting overlapping NRT/STC versions.
+S3_NAME_RE = re.compile(
+    r"^(?P<mission>S3[AB_])_SR_2_LAN_SI_"
+    r"(?P<start>\d{8}T\d{6})_(?P<stop>\d{8}T\d{6})_(?P<created>\d{8}T\d{6})_"
+    r"(?P<instance>.{17})_(?P<centre>.{3})_(?P<platform>.)_(?P<timeliness>NR|ST|NT)_(?P<baseline>\d{3})"
+)
 
-    Prefer near-real-time (NR) for the daily operational product. If NR is not
-    available, use ST; otherwise keep the returned products.
+
+def s3_pass_key(name: str) -> tuple[tuple, tuple] | None:
+    """Return (pass identity, preference) for a Sentinel-3 product name.
+
+    The pass is identified by mission, cycle and relative orbit from the
+    instance id (``DDDD_CCC_LLL_FFFF``); if those are blank, the sensing
+    start time is used instead. Preference ranks NT > ST > NR, then the
+    newest baseline, then the newest creation time.
     """
-    nr = [p for p in products if "_NR_" in p.name.upper()]
-    if nr:
-        return nr
-    st = [p for p in products if "_ST_" in p.name.upper()]
-    return st or products
+    match = S3_NAME_RE.match(Path(name).name)
+    if not match:
+        return None
+    parts = match["instance"].strip("_").split("_")
+    if len(parts) >= 3 and all(p.isdigit() for p in parts[1:3]):
+        identity = (match["mission"], parts[1], parts[2])
+    else:
+        identity = (match["mission"], match["start"])
+    preference = (TIMELINESS_RANK[match["timeliness"]], match["baseline"], match["created"])
+    return identity, preference
 
 
-def download_s3_product(product: Product, target_dir: Path, token: str) -> Path:
+def choose_s3_timeliness(items: list, name=lambda item: item.name) -> list:
+    """Keep one version per Sentinel-3 pass to avoid double counting.
+
+    NR/ST/NT versions and reprocessing baselines of one pass overlap in time
+    and space. For each pass the best version is kept (NT > ST > NR, then the
+    newest baseline). Items whose name cannot be parsed are kept as they are.
+    """
+    best: dict[tuple, tuple[tuple, object]] = {}
+    unparsed = []
+    for item in items:
+        key = s3_pass_key(name(item))
+        if key is None:
+            unparsed.append(item)
+            continue
+        identity, preference = key
+        if identity not in best or preference > best[identity][0]:
+            best[identity] = (preference, item)
+    chosen = {id(item) for _, item in best.values()}
+    return [item for item in items if id(item) in chosen] + unparsed
+
+
+def fetch_s3_archive(product: Product, archive: Path, auth: CdseAuth) -> None:
+    """Download into a temporary ``.part`` file and rename only when complete."""
+    url = f"{DOWNLOAD}({product.id})/$value"
+    partial = archive.with_name(archive.name + ".part")
+    for attempt in range(2):
+        headers = {"Authorization": f"Bearer {auth.token(force_refresh=attempt > 0)}"}
+        with requests.get(url, headers=headers, stream=True, timeout=600) as response:
+            if response.status_code == 401 and attempt == 0:
+                continue
+            response.raise_for_status()
+            with partial.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+        partial.replace(archive)
+        return
+
+
+def download_s3_product(product: Product, target_dir: Path, auth: CdseAuth) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     stem = product.name[:-5] if product.name.endswith(".SEN3") else product.name
     product_dir = target_dir / f"{stem}.SEN3"
@@ -166,16 +263,15 @@ def download_s3_product(product: Product, target_dir: Path, token: str) -> Path:
 
     archive = target_dir / f"{stem}.zip"
     if not archive.exists():
-        url = f"{DOWNLOAD}({product.id})/$value"
-        headers = {"Authorization": f"Bearer {token}"}
-        with requests.get(url, headers=headers, stream=True, timeout=600) as response:
-            response.raise_for_status()
-            with archive.open("wb") as handle:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
-
-    with zipfile.ZipFile(archive) as zf:
+        fetch_s3_archive(product, archive, auth)
+    try:
+        zf = zipfile.ZipFile(archive)
+    except zipfile.BadZipFile:
+        # A corrupt archive left by an older run: fetch it again once.
+        archive.unlink()
+        fetch_s3_archive(product, archive, auth)
+        zf = zipfile.ZipFile(archive)
+    with zf:
         zf.extractall(target_dir)
 
     if product_dir.exists():
@@ -223,6 +319,36 @@ def compute_sit(freeboard, snow_depth, snow_density, ice_density) -> np.ndarray:
     return sit
 
 
+def radar_to_ice_freeboard(radar_freeboard, snow_depth, snow_density) -> np.ndarray:
+    """Convert radar freeboard to sea-ice freeboard.
+
+    The Ku-band echo travels slower in snow, so the radar freeboard is lower
+    than the ice freeboard: fi = fr + hs * (c / cs - 1), with
+    c / cs = (1 + 0.51 * rho_s / 1000) ** 1.5 (Ulaby et al., 1986).
+    """
+    rho_s = np.asarray(snow_density, dtype=float)
+    ratio = (1.0 + 0.51 * rho_s / 1000.0) ** 1.5
+    return np.asarray(radar_freeboard, dtype=float) + np.asarray(snow_depth, dtype=float) * (ratio - 1.0)
+
+
+def is_sea_ice_class(label: str) -> bool:
+    return label == "sea_ice" or "floe" in label
+
+
+def sea_ice_class_values(attrs: dict) -> list[int] | None:
+    """Return the surface-class codes that mean sea-ice floe, from CF flag attributes."""
+    values = attrs.get("flag_values")
+    meanings = attrs.get("flag_meanings")
+    if values is None or not meanings:
+        return None
+    codes = np.atleast_1d(np.asarray(values)).tolist()
+    names = str(meanings).lower().split()
+    if len(codes) != len(names):
+        return None
+    selected = [int(code) for code, label in zip(codes, names) if is_sea_ice_class(label)]
+    return selected or None
+
+
 def make_frame(
     *,
     time,
@@ -236,16 +362,19 @@ def make_frame(
     sensor: str,
     concentration=None,
     surface_class=None,
+    sea_ice_classes: list[int] | None = None,
     official_sit=None,
     radar_freeboard=None,
-    require_surface_class_one: bool = False,
+    freeboard_source: str = "sea_ice_freeboard",
 ) -> pd.DataFrame:
     lat = np.asarray(lat, dtype=float)
     lon = np.asarray(lon, dtype=float)
-    freeboard = np.asarray(freeboard, dtype=float)
-    snow_depth = np.asarray(snow_depth, dtype=float)
-    snow_density = np.asarray(snow_density, dtype=float)
-    ice_density = np.asarray(ice_density, dtype=float)
+    shape = lat.shape
+    # Some L2 products store densities as a scalar per file.
+    freeboard = np.broadcast_to(np.asarray(freeboard, dtype=float), shape)
+    snow_depth = np.broadcast_to(np.asarray(snow_depth, dtype=float), shape)
+    snow_density = np.broadcast_to(np.asarray(snow_density, dtype=float), shape)
+    ice_density = np.broadcast_to(np.asarray(ice_density, dtype=float), shape)
     concentration = normalise_concentration(concentration)
 
     # Conservative physical limits before the hydrostatic calculation.
@@ -262,8 +391,8 @@ def make_frame(
 
     if concentration is not None:
         valid &= np.isfinite(concentration) & (concentration >= 15.0)
-    if require_surface_class_one and surface_class is not None:
-        valid &= np.asarray(surface_class) == 1
+    if surface_class is not None and sea_ice_classes is not None:
+        valid &= np.isin(np.asarray(surface_class), sea_ice_classes)
 
     data = {
         "time": pd.DatetimeIndex(time)[valid],
@@ -276,6 +405,7 @@ def make_frame(
         "ice_density_kg_m3": ice_density[valid],
         "source": source,
         "sensor": sensor,
+        "freeboard_source": freeboard_source,
     }
     if concentration is not None:
         data["sea_ice_concentration_pct"] = concentration[valid]
@@ -307,14 +437,35 @@ def read_s3_l2(path: Path) -> pd.DataFrame:
         time = time_array(ds, ["time_20_ku"])
 
         # These aliases match the real SR_2_LAN_SI files observed in this project.
-        freeboard = array(ds, ["sea_ice_freeboard_20_ku", "radar_freeboard_20_ku"]).astype(float)
-        radar_freeboard = array(ds, ["radar_freeboard_20_ku"], required=False)
         snow_depth = array(ds, ["snow_depth_sol1_20_ku", "snow_depth_sol2_20_ku"]).astype(float)
         snow_density = array(ds, ["snow_density_20_ku"]).astype(float)
         ice_density = array(ds, ["sea_ice_density_20_ku", "ice_density_20_ku"]).astype(float)
+        radar_freeboard = array(ds, ["radar_freeboard_20_ku"], required=False)
+        sea_ice_freeboard = array(ds, ["sea_ice_freeboard_20_ku"], required=False)
+        if sea_ice_freeboard is not None:
+            freeboard = sea_ice_freeboard.astype(float)
+            freeboard_source = "sea_ice_freeboard"
+        elif radar_freeboard is not None:
+            # Radar freeboard is not ice freeboard: correct for wave speed in snow.
+            freeboard = radar_to_ice_freeboard(radar_freeboard, snow_depth, snow_density)
+            freeboard_source = "radar_freeboard_corrected"
+        else:
+            raise KeyError("Neither sea_ice_freeboard_20_ku nor radar_freeboard_20_ku found")
 
         concentration = array(ds, ["sea_ice_concentration_20_ku"], required=False)
-        surface_class = array(ds, ["surf_type_class_20_ku", "surf_type_20_ku"], required=False)
+        # Only the sea-ice classification is used. The generic surf_type_20_ku
+        # (open ocean / enclosed seas / continental ice / land) is not a floe flag.
+        surface_class = None
+        sea_ice_classes = None
+        if "surf_type_class_20_ku" in ds.variables:
+            surface_class = np.asarray(ds["surf_type_class_20_ku"].values)
+            sea_ice_classes = sea_ice_class_values(ds["surf_type_class_20_ku"].attrs)
+            if sea_ice_classes is None:
+                print(
+                    f"[warn s3] {path.name}: surf_type_class_20_ku has no usable flag_meanings; "
+                    "surface-class filter not applied",
+                    file=sys.stderr,
+                )
         official_sit = array(ds, ["sea_ice_thickness_20_ku"], required=False)
 
     return make_frame(
@@ -329,9 +480,10 @@ def read_s3_l2(path: Path) -> pd.DataFrame:
         sensor="Sentinel-3",
         concentration=concentration,
         surface_class=surface_class,
+        sea_ice_classes=sea_ice_classes,
         official_sit=official_sit,
         radar_freeboard=radar_freeboard,
-        require_surface_class_one=True,
+        freeboard_source=freeboard_source,
     )
 
 
@@ -382,7 +534,8 @@ def discover_s3(raw_dir: Path) -> list[Path]:
         return []
     products = sorted(raw_dir.glob("*.SEN3"))
     products += sorted(raw_dir.glob("*.nc"))
-    return products
+    # A local archive can hold NR, ST and NT copies of the same pass.
+    return choose_s3_timeliness(products)
 
 
 def discover_cs2(raw_dir: Path) -> list[Path]:
@@ -620,12 +773,12 @@ def run(args) -> None:
         products = search_s3_products(start, target + timedelta(seconds=1))
         print(f"Sentinel-3 Russian-Arctic products: {len(products)}")
         if products:
-            token = get_access_token()
+            auth = CdseAuth()
             s3_paths = []
             for index, product in enumerate(products, 1):
                 print(f"[S3 {index}/{len(products)}] {product.name}")
                 try:
-                    s3_paths.append(download_s3_product(product, s3_dir, token))
+                    s3_paths.append(download_s3_product(product, s3_dir, auth))
                 except Exception as exc:
                     print(f"[download failed] {product.name}: {exc}", file=sys.stderr)
 

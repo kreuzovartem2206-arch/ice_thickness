@@ -23,12 +23,12 @@ SIT = (rho_water * sea_ice_freeboard + snow_density * snow_depth)
 Для реальных Sentinel-3 файлов используются:
 
 - `sea_ice_freeboard_20_ku`
-- `radar_freeboard_20_ku` — сохраняется для анализа
+- `radar_freeboard_20_ku` — сохраняется для анализа; если `sea_ice_freeboard_20_ku` нет, пересчитывается в ледовый фрибод с поправкой на скорость волны в снегу `fi = fr + hs·((1 + 0.51·rho_s/1000)^1.5 − 1)`
 - `snow_depth_sol1_20_ku` (fallback: `snow_depth_sol2_20_ku`)
 - `snow_density_20_ku`
 - `sea_ice_density_20_ku` (fallback: `ice_density_20_ku`)
 - `sea_ice_concentration_20_ku`
-- `surf_type_class_20_ku`
+- `surf_type_class_20_ku` — оставляются только классы льдины (`floe`/`sea_ice`) по атрибуту `flag_meanings`; если атрибута нет, фильтр не применяется и выводится предупреждение
 
 `sea_ice_thickness_20_ku` не используется для построения карты. Он сохраняется только для независимой проверки нашего расчёта; metadata содержит bias/MAE/RMSE/correlation.
 
@@ -82,6 +82,10 @@ python .\src\daily_multisat_l2_sit.py --date 2026-09-15 --days 7 --grid-m 1000 -
 ```
 
 В этом режиме `--s3-download` отсутствует, поэтому повторной загрузки нет.
+
+Если в папке лежат несколько версий одного прохода (NR, ST, NT или разные baseline), используется одна: NT > ST > NR, затем самый новый baseline. То же правило действует при скачивании из CDSE.
+
+Токен CDSE обновляется автоматически во время долгой загрузки. Архив сначала пишется во временный файл `.zip.part`, поэтому оборванная загрузка не оставляет битый `.zip`.
 
 ## CryoSat-2
 
